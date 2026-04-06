@@ -1,28 +1,53 @@
-from flask import Flask, render_template, request
+from flask import Flask, render_template, request, jsonify
 import psycopg2
 import pandas as pd
 import plotly.graph_objects as go
 import threading
 import time
+import os
 from twilio.rest import Client
-import keys  # Assuming keys.py contains your Twilio credentials
 from sklearn.linear_model import LinearRegression
 import numpy as np
 
+try:
+    import keys  # Optional local module for Twilio credentials
+except ModuleNotFoundError:
+    keys = None
 
-app = Flask(__name__)
+
+app = Flask(__name__, template_folder='.')
 
 # Database connection parameters
 CONNECTION = {
-    'dbname': 'tsdb',
-    'user': 'tsdbadmin',
-    'password': 'h60vpq2gtlciio28',
-    'host': 'wls9pfrz5j.px5bmnhsbk.tsdb.cloud.timescale.com',
-    'port': '31081'
+    'dbname': os.getenv('DB_NAME', 'tsdb'),
+    'user': os.getenv('DB_USER', 'tsdbadmin'),
+    'password': os.getenv('DB_PASSWORD', 'h60vpq2gtlciio28'),
+    'host': os.getenv('DB_HOST', 'wls9pfrz5j.px5bmnhsbk.tsdb.cloud.timescale.com'),
+    'port': os.getenv('DB_PORT', '31081')
 }
 
 # Twilio client setup
-client = Client(keys.account_sid, keys.auth_token)
+account_sid = os.getenv('TWILIO_ACCOUNT_SID')
+auth_token = os.getenv('TWILIO_AUTH_TOKEN')
+twilio_number = os.getenv('TWILIO_NUMBER')
+target_number = os.getenv('TWILIO_TARGET_NUMBER')
+
+if keys:
+    account_sid = account_sid or getattr(keys, 'account_sid', None)
+    auth_token = auth_token or getattr(keys, 'auth_token', None)
+    twilio_number = twilio_number or getattr(keys, 'twilio_number', None)
+    target_number = target_number or getattr(keys, 'target_number', None)
+
+client = Client(account_sid, auth_token) if account_sid and auth_token else None
+
+
+def get_db_status():
+    try:
+        conn = psycopg2.connect(connect_timeout=3, **CONNECTION)
+        conn.close()
+        return 'ok', None
+    except psycopg2.Error as e:
+        return 'unreachable', str(e)
 
 def predict_future_values(model, X, num_steps=10):
     last_timestamp = X[-1]
@@ -110,10 +135,13 @@ def create_trend_analysis_figures(df, metric, num_future_steps=10):
 
 # Function to send an alert via Twilio
 def send_alert(alert, alert_type):
+    if not client or not twilio_number or not target_number:
+        return
+
     client.messages.create(
         body=alert,
-        from_=keys.twilio_number,
-        to=keys.target_number
+        from_=twilio_number,
+        to=target_number
     )
 
 
@@ -149,7 +177,13 @@ def monitor_alerts():
 
 # Function to fetch paginated data and generate alerts
 def fetch_paginated_data_and_alerts(limit, offset, table_name, start_date=None, end_date=None):
-    conn = psycopg2.connect(**CONNECTION)
+    empty_df = pd.DataFrame(columns=[
+        'Timestamp',
+        'Water Level (m)',
+        'Temperature (°C)',
+        'Pressure (Pa)',
+        'Battery Level (%)'
+    ])
 
     # Prepare date filters for SQL query
     date_filter = ""
@@ -162,8 +196,13 @@ def fetch_paginated_data_and_alerts(limit, offset, table_name, start_date=None, 
         ORDER BY "Timestamp"
         LIMIT {limit} OFFSET {offset};
     """
-    df = pd.read_sql(query, conn)
-    conn.close()
+
+    try:
+        conn = psycopg2.connect(**CONNECTION)
+        df = pd.read_sql(query, conn)
+        conn.close()
+    except psycopg2.Error as e:
+        return empty_df, [], [], [f"Database connection error: {e}"]
 
     # Generate alerts based on water level, battery level, and null values
     water_level_alerts = []
@@ -389,6 +428,21 @@ def index():
 
     df, water_level_alerts, battery_level_alerts,null_value_alerts = fetch_paginated_data_and_alerts(30, 0, table_name, start_date, end_date)
 
+    if df.empty:
+        return render_template(
+            'index.html',
+            selected_graph_html='<p>No data available. Check database connection settings.</p>',
+            z_score_graph_html='',
+            iqr_graph_html='',
+            trend_graph_html='',
+            water_level_alerts=water_level_alerts,
+            battery_level_alerts=battery_level_alerts,
+            null_value_alerts=null_value_alerts,
+            selected_metric=metric,
+            start_date=start_date,
+            end_date=end_date
+        )
+
     # Update timestamps to hourly intervals and aggregate data
     df['Timestamp'] = pd.to_datetime(df['Timestamp']).dt.floor('H')
 
@@ -450,6 +504,18 @@ def areas():
         30, 0, table_name, start_date, end_date
     )
 
+    if df.empty:
+        return render_template(
+            'areas.html',
+            selected_graph_html='<p>No data available. Check database connection settings.</p>',
+            z_score_graph_html='',
+            iqr_graph_html='',
+            trend_graph_html='',
+            water_level_alerts=water_level_alerts,
+            battery_level_alerts=battery_level_alerts,
+            null_value_alerts=null_value_alerts
+        )
+
     df['Timestamp'] = pd.to_datetime(df['Timestamp']).dt.floor('H')
 
     # Create figures
@@ -486,6 +552,23 @@ def areas():
         water_level_alerts=water_level_alerts,
         battery_level_alerts=battery_level_alerts
     )
+
+
+@app.route('/health')
+def health():
+    db_status, db_error = get_db_status()
+    twilio_configured = bool(client and twilio_number and target_number)
+
+    response = {
+        'status': 'ok' if db_status == 'ok' else 'degraded',
+        'database': db_status,
+        'twilio_configured': twilio_configured
+    }
+
+    if db_error:
+        response['database_error'] = db_error
+
+    return jsonify(response), (200 if db_status == 'ok' else 503)
 
 
 
